@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "paper-llm-review"
+version = "0.1.0"
+description = ""
+authors = ["Krzysztof Suwada <krzysztof.suwada@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "3.10.12"
+streamlit = "^1.41.1"
+langchain-google-vertexai = "^2.0.11"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
