@@ -1,27 +1,30 @@
-import os
-import logging
+import subprocess
 import re
+import pandas as pd
 import streamlit as st
+import logging
 from langchain_google_vertexai import VertexAI
 from langchain.prompts import PromptTemplate
-from typing import List
+import json
+import difflib
+import diskcache as dc
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize LLM
+# Set up diskcache for caching
+cache = dc.Cache(".llm_cache")
+
 def initialize_llm():
     """Initializes the Google Vertex AI model."""
     logger.info("Initializing Google Vertex AI model.")
     try:
         llm = VertexAI(
             temperature=0.0,
-            project=os.environ.get("VERTEX_PROJECT"),
-            location=os.environ.get("VERTEX_LOCATION"),
-            model_name=os.environ.get("VERTEX_MODEL", "gemini-1.5-flash-002")
+            project="nexocode-lab",
+            location="us-central1",
+            model_name="gemini-1.5-flash-002",
         )
         logger.info("Successfully initialized Vertex AI model.")
         return llm
@@ -30,161 +33,189 @@ def initialize_llm():
         st.error(f"Error initializing LLM. Please check your environment variables: {e}")
         return None
 
-llm = initialize_llm()
 
-def get_grammar_check_pipeline():
-    """
-    Creates and returns a LangChain LLMChain configured for grammar checking.
-    """
-    logger.debug("Creating grammar check pipeline.")
-    prompt = PromptTemplate(
-        template="""
-        You are an expert English grammar checker. Given the following paragraph,
-        identify any grammatical errors and provide a suggestion for each correction.
-        Do not change the original text but provide the suggestion next to it, so the user can review them and accept them, modify or reject.
-        If there are no errors, do not include suggestions. The text is in latex format and you should keep it in the same format.
-        Paragraph:
-        {paragraph}
-        """,
-        input_variables=["paragraph"]
-    )
-    chain = prompt | llm
-    return chain
+proofread_template = PromptTemplate(
+    input_variables=["chunk"],
+    template="""Proofread the following mathematical text and correct any grammar mistakes: {chunk}.
+        Ignore LaTeX formulas, figures and tables.
 
-def call_llm_grammar_check(paragraph: str) -> str:
-    """
-    Uses the LLM chain to perform grammar checks on the provided paragraph.
-    """
-    if not llm:
-        st.error("LLM not initialized. Please check the logs.")
-        return ""
-    logger.debug("Preparing to call LLM chain for grammar check.")
-    chain = get_grammar_check_pipeline()
+        List correction reasons for each correction in separate line.
+
+    Return only the following as response:
+    {{
+        'needs_correction': true or false flag,
+        'corrected_text': corrected_text,
+        'correction_reason': correction_reason,
+    }}"""
+)
+
+
+def convert_latex_to_markdown(latex_file):
+    """Converts a LaTeX file to a Markdown file using pandoc, removing \ref{...} expressions."""
+    logger.info("Converting LaTeX file to Markdown.")
     try:
-        result = chain.invoke({"paragraph": paragraph})
-        logger.debug("Raw LLM output for grammar check: %s", result)
-        return result
+        with open(latex_file, "r") as f:
+            latex_content = f.read()
+        cleaned_content = re.sub(r"\\ref\{.*?\}", "", latex_content)
+
+        temp_file = "temp_latex_file.tex"
+        with open(temp_file, "w") as f:
+            f.write(cleaned_content)
+
+        output_file = "output.md"
+        subprocess.run(["pandoc", temp_file, "-o", output_file], check=True)
+
+        logger.info("Successfully converted LaTeX to Markdown.")
+        with open(output_file, "r") as f:
+            return f.read()
     except Exception as e:
-        logger.error(f"Error during LLM call: {e}")
-        st.error("Error during LLM call. Check logs for details.")
+        logger.error(f"Failed to convert LaTeX to Markdown: {e}")
         return ""
 
-def parse_latex_file(file_path: str) -> List[str]:
-    """
-    Reads a LaTeX file, extracts paragraph content, and keeps the latex format.
-    """
-    try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            content = file.read()
-        # Split the content into paragraphs, keeping latex commands
-        # This regex will not split inside of a single paragraph with math commands
-        paragraphs = re.split(r'\n\s*\n', content)
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
 
-        logger.info(f"Successfully parsed LaTeX file with {len(paragraphs)} paragraphs.")
-        return paragraphs
-    except FileNotFoundError:
-        logger.error(f"File not found: {file_path}")
-        st.error(f"File not found: {file_path}")
-        return []
-    except Exception as e:
-        logger.error(f"Error reading or parsing the LaTeX file: {e}")
-        st.error(f"Error reading or parsing the LaTeX file: {e}")
-        return []
+def split_text_into_chunks(markdown_text):
+    """Splits the Markdown text into chunks by empty lines and concatenates short chunks."""
+    logger.info("Splitting Markdown text into chunks by empty lines.")
+    chunks = [chunk.strip() for chunk in re.split(r'(?:\n\s*\n)+', markdown_text) if chunk.strip()]
+
+    concatenated_chunks = []
+    temp_chunk = ""
+
+    for chunk in chunks:
+        if temp_chunk:
+            temp_chunk += "\n" + chunk
+            concatenated_chunks.append(temp_chunk)
+            temp_chunk = ""
+        elif len(chunk.splitlines()) <= 2:
+            temp_chunk = chunk
+        else:
+            concatenated_chunks.append(chunk)
+
+    if temp_chunk:
+        concatenated_chunks.append(temp_chunk)
+
+    return concatenated_chunks
 
 
-def apply_changes(
-        paragraphs: List[str],
-        suggestions: List[str],
-        user_edits: List[str],
-        actions: List[str]
-) -> List[str]:
-    """Applies the user accepted or modified changes to the original text."""
-    updated_paragraphs = []
+def highlight_differences(original, corrected):
+    """Highlights differences between original and corrected text using difflib, ignoring whitespaces and matching whole words."""
+    original_words = original.split()
+    corrected_words = corrected.split()
 
-    for original, suggestion, user_edit, action in zip(paragraphs, suggestions, user_edits, actions):
-        if action == "accept":
-            if suggestion:
-                updated_paragraphs.append(suggestion)
-            else:
-                updated_paragraphs.append(original)
-        elif action == "reject":
-            updated_paragraphs.append(original)
-        elif action == "modify":
-            updated_paragraphs.append(user_edit)
-        else:  # No action
-            updated_paragraphs.append(original)
-    return updated_paragraphs
+    diff = difflib.SequenceMatcher(None, original_words, corrected_words)
+    highlighted_lines = []
+
+    for tag, i1, i2, j1, j2 in diff.get_opcodes():
+        if tag == 'replace':
+            highlighted_lines.append((" ".join(original_words[i1:i2]), " ".join(corrected_words[j1:j2]), True))
+        elif tag == 'equal':
+            highlighted_lines.append((" ".join(original_words[i1:i2]), " ".join(corrected_words[j1:j2]), False))
+    return highlighted_lines
+
+
+def proofread_chunk(chunk, llm):
+    """Uses LLM to proofread a chunk of text with caching."""
+    cache_key = f"proofread_{hash(chunk)}"
+    if cache_key in cache:
+        logger.info("Cache hit for chunk.")
+        return cache[cache_key]
+
+    prompt = proofread_template.format(chunk=chunk)
+    response = llm.invoke(prompt)
+    cache[cache_key] = response
+    logger.info("Response cached.")
+    return response
+
+
+def replace_latex_math_with_equation(text):
+    """Replace LaTeX math formulas in a string with the word 'EQUATION'."""
+    return re.sub(r'\$\$(.*?)\$\$', 'equation placeholder', text, flags=re.DOTALL)
+
 
 def main():
-    st.title("LaTeX Grammar Checker")
+    st.set_page_config(layout="wide")
+    llm = initialize_llm()
 
-    # File uploader
-    uploaded_file = st.file_uploader("Upload a LaTeX file", type=["tex", "latex"])
+    st.title("LaTeX to Markdown Converter with Grammar Check")
+
+    uploaded_file = st.file_uploader("Upload a LaTeX file", type="tex")
     if uploaded_file:
-        # Save the file temporarily for processing
-        file_path = "temp_file.tex"
-        with open(file_path, "wb") as f:
+        with open("uploaded.tex", "wb") as f:
             f.write(uploaded_file.read())
 
-        paragraphs = parse_latex_file(file_path)
+        markdown_text = convert_latex_to_markdown("uploaded.tex")
 
-        if not paragraphs:
-            st.error("No paragraphs found in file.")
-            return
+        if markdown_text:
+            chunks = split_text_into_chunks(markdown_text)[:2]
 
-        if 'suggestions' not in st.session_state:
-            st.session_state['suggestions'] = [""] * len(paragraphs)
-        if 'user_edits' not in st.session_state:
-            st.session_state['user_edits'] = [""] * len(paragraphs)
-        if 'actions' not in st.session_state:
-            st.session_state['actions'] = [""] * len(paragraphs)
+            if "accepted_text" not in st.session_state:
+                st.session_state["accepted_text"] = []
 
+            total_chunks = len(chunks)
+            progress_bar = st.progress(0)
 
+            for i, chunk in enumerate(chunks):
+                chunk = replace_latex_math_with_equation(chunk)
 
-        # Process each paragraph
-        for i, paragraph in enumerate(paragraphs):
-            st.subheader(f"Paragraph {i+1}")
-            col1, col2 = st.columns(2)
+                if llm:
+                    try:
+                        response = proofread_chunk(chunk, llm)
+                        json_string = response[response.find("{"):response.rfind("}") + 1]
+                        response_json = json.loads(json_string)
+                    except Exception as e:
+                        logger.error(f"Failed to process chunk: {chunk} | Error: {e}")
+                        st.error(f"Failed to process chunk: {e}")
+                        continue
 
-            with col1:
-                st.markdown("**Original:**")
-                st.write(paragraph)
+                    if response_json.get("needs_correction"):
+                        original_text = chunk
+                        corrected_text = response_json.get("corrected_text", "")
 
-            with col2:
-                st.markdown("**Proposed:**")
-                if not st.session_state['suggestions'][i]: # Check to avoid multiple calls
-                    suggestion = call_llm_grammar_check(paragraph)
-                    st.session_state['suggestions'][i] = suggestion
-                st.write(st.session_state['suggestions'][i])
+                        highlighted_lines = highlight_differences(original_text, corrected_text)
 
-                st.session_state['user_edits'][i] = st.text_area("Edit", value = st.session_state['suggestions'][i], key = f"edit_{i}")
+                        was_last_one_ok = True
+                        fine_text_to_append = ""
 
-                col_buttons = st.columns(3)
-                with col_buttons[0]:
-                    if st.button("Accept", key = f"accept_{i}"):
-                        st.session_state['actions'][i] = "accept"
-                with col_buttons[1]:
-                    if st.button("Reject", key = f"reject_{i}"):
-                        st.session_state['actions'][i] = "reject"
-                with col_buttons[2]:
-                    if st.button("Modify", key = f"modify_{i}"):
-                        st.session_state['actions'][i] = "modify"
+                        for j, (line_original, line_corrected, is_different) in enumerate(highlighted_lines):
 
-        if st.button("Apply Changes"):
-            updated_paragraphs = apply_changes(
-                paragraphs,
-                st.session_state['suggestions'],
-                st.session_state['user_edits'],
-                st.session_state['actions']
-            )
-            st.session_state['actions'] = [""] * len(paragraphs)
-            st.session_state['suggestions'] = [""] * len(paragraphs)
+                            if was_last_one_ok is True and is_different is True:
+                                st.markdown(fine_text_to_append)
 
-            st.session_state['user_edits'] = [""] * len(paragraphs)
+                                fine_text_to_append = ""
+                                was_last_one_ok = False
 
-            st.write("## Modified Document")
-            st.write("\n\n".join(updated_paragraphs))
+                            if was_last_one_ok is True and is_different is False:
+                                st.session_state.accepted_text.append(line_original)
+                                fine_text_to_append += " " + line_original
+
+                            if was_last_one_ok is False and is_different is False:
+                                was_last_one_ok = True
+                                fine_text_to_append = line_original
+
+                            if was_last_one_ok is False and is_different is True:
+                                st.session_state.accepted_text.append("PLACEHOLDER")
+                                st.markdown(f"<div><span style='color: red;'>{line_original}</span> → <span style='color: green;'>{line_corrected}</span></div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(chunk)
+                        st.session_state.accepted_text.append(chunk)
+
+                progress_bar.progress((i + 1) / total_chunks)
+
+            # if st.button("Export Accepted Suggestions"):
+            #     df = pd.DataFrame(results)
+            #     df.to_excel("accepted_suggestions.xlsx", index=False)
+            #     st.success("Exported suggestions to accepted_suggestions.xlsx.")
+            #
+            # if st.button("Download Full Text as Markdown"):
+            #     full_text = "\n\n".join(st.session_state.accepted_text)
+            #     with open("final_text.md", "w") as f:
+            #         f.write(full_text)
+            #     st.download_button(
+            #         label="Download Markdown File",
+            #         data=full_text,
+            #         file_name="final_text.md",
+            #         mime="text/markdown"
+            #     )
 
 if __name__ == "__main__":
     main()
