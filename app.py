@@ -37,15 +37,12 @@ def initialize_llm():
 proofread_template = PromptTemplate(
     input_variables=["chunk"],
     template="""Proofread the following mathematical text and correct any grammar mistakes: {chunk}.
-        Ignore LaTeX formulas, figures and tables.
-
-        List correction reasons for each correction in separate line.
-
+        Ignore LaTeX formulas, figures and tables, escape control character if needed.
+        
     Return only the following as response:
     {{
         'needs_correction': true or false flag,
         'corrected_text': corrected_text,
-        'correction_reason': correction_reason,
     }}"""
 )
 
@@ -56,6 +53,7 @@ def convert_latex_to_markdown(latex_file):
     try:
         with open(latex_file, "r") as f:
             latex_content = f.read()
+
         cleaned_content = re.sub(r"\\ref\{.*?\}", "", latex_content)
 
         temp_file = "temp_latex_file.tex"
@@ -67,7 +65,19 @@ def convert_latex_to_markdown(latex_file):
 
         logger.info("Successfully converted LaTeX to Markdown.")
         with open(output_file, "r") as f:
-            return f.read()
+            markdown_text = f.read()
+
+        # Perform header replacements
+        # markdown_text = re.sub(r"^(.*) \{#.*\}$", r"#  \1", markdown_text, flags=re.MULTILINE)
+        markdown_text = re.sub(r"^(.*)\n={1,}$", r"# \1\\n", markdown_text,
+                               flags=re.MULTILINE)  # Convert === underlined headers to #
+        markdown_text = re.sub(r"^(.*)\n-{1,}$", r"## \1\\n", markdown_text,
+                               flags=re.MULTILINE)  # Convert --- underlined headers to ##
+
+        # Remove citation references like [@Blum]
+        markdown_text = re.sub(r"\[@.*?\]", "", markdown_text)
+
+        return markdown_text
     except Exception as e:
         logger.error(f"Failed to convert LaTeX to Markdown: {e}")
         return ""
@@ -128,8 +138,9 @@ def proofread_chunk(chunk, llm):
 
 
 def replace_latex_math_with_equation(text):
-    """Replace LaTeX math formulas in a string with the word 'EQUATION'."""
-    return re.sub(r'\$\$(.*?)\$\$', 'equation placeholder', text, flags=re.DOTALL)
+    text =  re.sub(r'\$\$(.*?)\$\$', 'equation placeholder', text, flags=re.DOTALL)
+    text = re.sub(r"\\(.*?) ", "\1", text, flags=re.DOTALL)
+    return text
 
 
 def main():
@@ -146,13 +157,15 @@ def main():
         markdown_text = convert_latex_to_markdown("uploaded.tex")
 
         if markdown_text:
-            chunks = split_text_into_chunks(markdown_text)[:2]
+            chunks = split_text_into_chunks(markdown_text)
 
             if "accepted_text" not in st.session_state:
                 st.session_state["accepted_text"] = []
 
             total_chunks = len(chunks)
             progress_bar = st.progress(0)
+
+            complete_text_with_corrections = ""
 
             for i, chunk in enumerate(chunks):
                 chunk = replace_latex_math_with_equation(chunk)
@@ -161,9 +174,10 @@ def main():
                     try:
                         response = proofread_chunk(chunk, llm)
                         json_string = response[response.find("{"):response.rfind("}") + 1]
+                        logger.info(json_string)
                         response_json = json.loads(json_string)
                     except Exception as e:
-                        logger.error(f"Failed to process chunk: {chunk} | Error: {e}")
+                        logger.error(f"Failed to process chunk. Error: {e}")
                         st.error(f"Failed to process chunk: {e}")
                         continue
 
@@ -179,8 +193,8 @@ def main():
                         for j, (line_original, line_corrected, is_different) in enumerate(highlighted_lines):
 
                             if was_last_one_ok is True and is_different is True:
-                                st.markdown(fine_text_to_append)
-
+                                # st.markdown(fine_text_to_append)
+                                complete_text_with_corrections += fine_text_to_append + " "
                                 fine_text_to_append = ""
                                 was_last_one_ok = False
 
@@ -194,13 +208,20 @@ def main():
 
                             if was_last_one_ok is False and is_different is True:
                                 st.session_state.accepted_text.append("PLACEHOLDER")
-                                st.markdown(f"<div><span style='color: red;'>{line_original}</span> → <span style='color: green;'>{line_corrected}</span></div>", unsafe_allow_html=True)
+                                suggestion = f"<span style='color: red;'>{line_original}</span> → <span style='color: green;'>{line_corrected}</span>"
+                                complete_text_with_corrections += suggestion + " "
+                                # st.markdown(suggestion, unsafe_allow_html=True)
+
                     else:
-                        st.markdown(chunk)
+                        complete_text_with_corrections += chunk
                         st.session_state.accepted_text.append(chunk)
 
+                # complete_text_with_corrections
+                st.markdown(complete_text_with_corrections, unsafe_allow_html=True)
+                complete_text_with_corrections = ""
                 progress_bar.progress((i + 1) / total_chunks)
 
+            # st.markdown(complete_text_with_corrections, unsafe_allow_html=True)
             # if st.button("Export Accepted Suggestions"):
             #     df = pd.DataFrame(results)
             #     df.to_excel("accepted_suggestions.xlsx", index=False)
